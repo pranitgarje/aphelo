@@ -20,6 +20,8 @@
 
 #include "hashtable.h"
 /*Remember how hashtable.cpp only gives us back an HNode*? We need to find the actual data (the string key/value) attached to it. This macro does pointer math. It takes the memory address of the HNode, subtracts its position inside the struct, and returns a pointer to the entire wrapper struct!*/
+
+typedef std::vector<uint8_t> Buffer;
 #define container_of(ptr, T, member) \
     ((T *)( (char *)ptr - offsetof(T, member) ))
 
@@ -143,18 +145,70 @@ static int32_t parse_req(const uint8_t *data,size_t size,std::vector<std::string
         }
         return 0;
 }
-// Response::status
+
+// error code for TAG_ERR
 enum {
-    RES_OK = 0,
-    RES_ERR = 1,    // error
-    RES_NX = 2,     // key not found
+    ERR_UNKNOWN = 1,    // unknown command
+    ERR_TOO_BIG = 2,    // response too big
 };
 
-// 1. The Output formot
-struct Response{
-    uint32_t status=0;  //A simple integer code (0 = OK, 1 = Error, etc.).
-    std::vector<uint8_t> data;  //The actual payload we want to send back to the client (like the value of a key).
+// data types of serialized data
+enum {
+    TAG_NIL = 0,    // nil
+    TAG_ERR = 1,    // error code + msg
+    TAG_STR = 2,    // string
+    TAG_INT = 3,    // int64
+    TAG_DBL = 4,    // double
+    TAG_ARR = 5,    // array
 };
+// help functions for the serialization
+static void buf_append_u8(Buffer &buf, uint8_t data) {
+    buf.push_back(data);
+}
+static void buf_append_u32(Buffer &buf, uint32_t data) {
+    buf_append(buf, (const uint8_t *)&data, 4);
+}
+static void buf_append_i64(Buffer &buf, int64_t data) {
+    buf_append(buf, (const uint8_t *)&data, 8);
+}
+static void buf_append_dbl(Buffer &buf, double data) {
+    buf_append(buf, (const uint8_t *)&data, 8);
+}
+
+
+// append serialized data types to the back
+static void out_nil(Buffer &out) {
+    buf_append_u8(out, TAG_NIL);
+}
+
+static void out_str(Buffer &out, const char *s, size_t size) {
+    buf_append_u8(out, TAG_STR);
+    buf_append_u32(out, (uint32_t)size);
+    buf_append(out, (const uint8_t *)s, size);
+}
+static void out_int(Buffer &out, int64_t val) {
+    buf_append_u8(out, TAG_INT);
+    buf_append_i64(out, val);
+}
+// static void out_dbl(Buffer &out, double val) {
+//     buf_append_u8(out, TAG_DBL);
+//     buf_append_dbl(out, val);
+// }
+static void out_err(Buffer &out, uint32_t code, const std::string &msg) {
+    buf_append_u8(out, TAG_ERR);
+    buf_append_u32(out, code);
+    buf_append_u32(out, (uint32_t)msg.size());
+    buf_append(out, (const uint8_t *)msg.data(), msg.size());
+}
+// static void out_arr(Buffer &out, uint32_t n) {
+//     buf_append_u8(out, TAG_ARR);
+//     buf_append_u32(out, n);
+// }
+// // 1. The Output format
+// struct Response{
+//     uint32_t status=0;  //A simple integer code (0 = OK, 1 = Error, etc.).
+//     std::vector<uint8_t> data;  //The actual payload we want to send back to the client (like the value of a key).
+// };
 static struct {
     HMap db;    // top-level hashtable
 } g_data;
@@ -189,7 +243,7 @@ static uint64_t str_hash(const uint8_t *data, size_t len) {
 }
 
 
-static void do_get(std::vector<std::string> &cmd, Response &out) {
+static void do_get(std::vector<std::string> &cmd, Buffer &out) {
     // a dummy `Entry` just for the lookup
     Entry key;              //We create a temporary, fake Entry just to hold the key we are looking for.
     key.key.swap(cmd[1]);
@@ -197,16 +251,14 @@ static void do_get(std::vector<std::string> &cmd, Response &out) {
     // hashtable lookup
     HNode *node = hm_lookup(&g_data.db, &key.node, &entry_eq);                   //We ask your custom hash table to find the node. We pass in the dummy key and our entry_eq comparison function. If it returns NULL, the key doesn't exist (RES_NX).
     if (!node) {
-        out.status = RES_NX;
-        return;
+       return out_nil(out);
     }
     // copy the value
     const std::string &val = container_of(node, Entry, node)->val;
-    assert(val.size() <= k_max_msg);
-    out.data.assign(val.begin(), val.end());
+    out_str(out, val.data(),val.size());
 }
 
-static void do_set(std::vector<std::string> &cmd, Response &) {
+static void do_set(std::vector<std::string> &cmd, Buffer &out) {
     // a dummy `Entry` just for the lookup
     Entry key;   //Similar to get, we create a dummy key and try to find it in the database first.
     key.key.swap(cmd[1]);                                       //
@@ -227,9 +279,11 @@ static void do_set(std::vector<std::string> &cmd, Response &) {
     /*If not found: We allocate fresh memory (new Entry()). 
     We fill it with the key, the pre-calculated hash code,
      and the value. Finally, we hand its &ent->node over to hm_insert to link it into the hash table.*/
+
+     return out_nil(out);  // NEW: Successfully set the data? Redis traditionally replies with NIL to save bandwidth.
 }
 
-static void do_del(std::vector<std::string> &cmd, Response &) {
+static void do_del(std::vector<std::string> &cmd, Buffer &out) {
     // a dummy `Entry` just for the lookup
     Entry key;
     key.key.swap(cmd[1]);
@@ -238,11 +292,13 @@ static void do_del(std::vector<std::string> &cmd, Response &) {
     HNode *node = hm_delete(&g_data.db, &key.node, &entry_eq);         //: This removes the node from the hash table's linked list and returns the detached node to us.
     if (node) { // deallocate the pair
         delete container_of(node, Entry, node);        //Because the hash table only manages links (not memory), it is our job to free the memory. We find the parent Entry and delete it so we don't cause a memory leak.
+        return out_int(out, 1); // NEW: Send an INT tag with '1' meaning "1 item deleted"
     }
+    return out_int(out,0); // NEW: If the key doesn't exist, we reply with '0' meaning "0 items deleted"
 }
 
 
-static void do_request(std::vector<std::string> &cmd, Response &out) {
+static void do_request(std::vector<std::string> &cmd, Buffer &out) {
     if (cmd.size() == 2 && cmd[0] == "get") {
         return do_get(cmd, out);
     } else if (cmd.size() == 3 && cmd[0] == "set") {
@@ -250,22 +306,22 @@ static void do_request(std::vector<std::string> &cmd, Response &out) {
     } else if (cmd.size() == 2 && cmd[0] == "del") {
         return do_del(cmd, out);
     } else {
-        out.status = RES_ERR;       // unrecognized command
+        return out_err(out, ERR_UNKNOWN, "unrecognized command");
     }
 }
 
-/*Structure: The response protocol is simple: [Total Length] [Status Code] [Data Payload].
-resp_len: It calculates 4 (for the status code) + size of data.
-buf_append: This is just a helper (likely using std::vector::insert) to push raw bytes onto the output buffer*/
-static void make_response(const Response &resp, std::vector<uint8_t> &out) {
-    uint32_t resp_len = 4 + (uint32_t)resp.data.size();
-    // 1. Append Total Length (4 bytes)
-    buf_append(out, (const uint8_t *)&resp_len, 4);
-    // 2. Append Status Code (4 bytes)
-    buf_append(out, (const uint8_t *)&resp.status, 4);
-    // 3. Append the Actual Data
-    buf_append(out, resp.data.data(), resp.data.size());
-}
+// /*Structure: The response protocol is simple: [Total Length] [Status Code] [Data Payload].
+// resp_len: It calculates 4 (for the status code) + size of data.
+// buf_append: This is just a helper (likely using std::vector::insert) to push raw bytes onto the output buffer*/
+// static void make_response(const Response &resp, std::vector<uint8_t> &out) {
+//     uint32_t resp_len = 4 + (uint32_t)resp.data.size();
+//     // 1. Append Total Length (4 bytes)
+//     buf_append(out, (const uint8_t *)&resp_len, 4);
+//     // 2. Append Status Code (4 bytes)
+//     buf_append(out, (const uint8_t *)&resp.status, 4);
+//     // 3. Append the Actual Data
+//     buf_append(out, resp.data.data(), resp.data.size());
+// }
 
 /*static int32_t read_full(int fd, char *buf, size_t n){
     while(n>0){
@@ -323,12 +379,28 @@ static bool try_one_request(Conn *conn) {
         conn->want_close = true;
         return false;   // want close
     }
-    // 2. Process the command
-     Response resp;
-    do_request(cmd, resp);
-    //// 3. Send the response back
-    make_response(resp, conn->outgoing);
-    // application logic done! remove the request message.
+    // // 2. Process the command
+    //  Response resp;
+    // do_request(cmd, resp);
+    // //// 3. Send the response back
+    // make_response(resp, conn->outgoing);
+    // // application logic done! remove the request message.
+
+    std::vector<uint8_t> &out=conn->outgoing;
+    // 1. The Placeholder Trick
+    out.insert(out.end(),4,0);   //We reserve 4 bytes at the end of the outgoing buffer for the length header. We will fill it in later after we know how big the response is.
+
+    // 2. Remember where we put the placeholder
+    // (In case the buffer already had data from a previous pipelined request)
+    size_t header_pos=out.size()-4;
+    // 3. Build the TLV message
+    // This will use out_str, out_nil, etc., to push bytes AFTER the placeholder.
+    do_request(cmd, out);
+    // 4. Calculate the actual length of the TLV data we just added
+    // (Total current size) - (Where the header started) - (4 bytes for the header itself)
+    uint32_t res_len = (uint32_t)(out.size() - header_pos - 4);
+    // 5. Overwrite the placeholder with the real length!
+    memcpy(out.data()+header_pos, &res_len, 4);   //We write the actual length of the response into the reserved header space.
     buf_consume(conn->incoming, 4 + len);
     // Q: Why not just empty the buffer? See the explanation of "pipelining".
     return true;        // success

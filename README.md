@@ -15,8 +15,8 @@ This project is built in C++ specifically to prioritize **control** and **perfor
 Instead of using HTTP/REST frameworks or standard library containers (`std::map`, `std::unordered_map`), this project builds them from the ground up. Handling raw byte streams over TCP minimizes packet overhead. Furthermore, the custom hash table ensures absolute control over the rehashing mechanics, eliminating "stop-the-world" latency spikes that occur during standard dictionary resizing.
 
 ---
-> **Current Version:** v1.1 (Custom Hash Table & Progressive Rehashing)
-> **Status:** Stable Core
+> **Current Version:** v1.2 (TLV Binary Serialization Protocol)
+> **Status:** Stable Core & Protocol Upgraded
 
 ## ⚡ Features
 
@@ -39,7 +39,7 @@ Unlike traditional blocking servers that spawn a thread per client, **redis-lite
 3.  **Parse & Execute:** The protocol parser extracts commands, routes them to the custom hash table, triggers any necessary progressive rehashing steps, and generates a response.
 4.  **Write:** The response is queued in `Conn.outgoing` and written back to the client only when the socket is writable.
 
-![Sequence Diagram](assets/Architecture_v1.1.png)
+![Sequence Diagram](assets/Architecture_v1.2.png)
 
 ### 2. Class Design & The Data Layer
 The system is designed to strictly separate the network state from the storage engine, utilizing an intrusive architecture for the data layer.
@@ -48,7 +48,7 @@ The system is designed to strictly separate the network state from the storage e
 * **HMap & HTab:** The custom dictionary manager that holds two tables (`newer` and `older`) to facilitate seamless, non-blocking migrations during resizes.
 * **Entry:** The application payload that stores the string key/value pairs. It intrusively embeds the `HNode` struct, allowing the hash table to manage linked lists of pointers while the application resolves the full data payload using the `container_of` macro.
 
-![Server Class Diagram](assets/server_class_diagram_v1.1.png)
+![Server Class Diagram](assets/server_class_diagram_v1.2.png)
 
 ---
 

@@ -106,7 +106,7 @@ void hm_clear(HMap *hmap) {                   //Frees all the memory
     *hmap = HMap{};
 }
 
-/*Adds up the items in both newer and older to tell you the total count.*/
+/*Adds up the items in both newer and older to tell you the total count.  */
 size_t hm_size(HMap *hmap) {
     return hmap->newer.size + hmap->older.size;
 }

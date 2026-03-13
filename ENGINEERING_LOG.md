@@ -37,3 +37,11 @@
     * **Progressive Rehashing:** Engineered an `HMap` manager holding two tables (`newer` and `older`). When the load factor is exceeded, a resize triggers, but the work is distributed. Subsequent `GET`/`SET`/`DEL` operations do a small chunk of work (`hm_help_rehashing`), gradually moving buckets to prevent blocking the event loop.
     * **Hashing Algorithm:** Integrated the FNV-1a algorithm for fast, uniform string hashing.
 * **Outcome:** Transformed the data layer into a highly specialized, latency-optimized, and fully custom in-memory store.
+
+## v1.2: TLV Binary Serialization Protocol (Current)
+* **Goal:** Implement a robust binary serialization protocol using Tag-Length-Value (TLV) to safely encode strings, integers, arrays, and errors.
+* **Architecture Shift:**
+    * **Zero-Copy Streaming:** Eliminated the intermediate `Response` struct. The server now streams TLV encoded bytes directly into the `conn->outgoing` buffer using targeted helper functions (`out_str`, `out_int`, etc.), preventing unnecessary memory allocations.
+    * **The Placeholder Trick:** Because the protocol requires a total message length header upfront, but the dynamic TLV message size isn't known until generation finishes, the server inserts a 4-byte zero placeholder, serializes the data, calculates the consumed bytes, and retroactively overwrites the placeholder.
+    * **Client Recursive Parsing:** Upgraded the client to parse binary streams dynamically. Implemented a recursive `print_response` function that reads the tag byte and conditionally consumes exactly the right amount of bytes, natively supporting nested arrays and preventing buffer underflows.
+* **Outcome:** A highly efficient, type-safe binary protocol that prepares the architecture for more complex, nested data types in the future.
