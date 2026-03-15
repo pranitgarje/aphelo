@@ -45,3 +45,13 @@
     * **The Placeholder Trick:** Because the protocol requires a total message length header upfront, but the dynamic TLV message size isn't known until generation finishes, the server inserts a 4-byte zero placeholder, serializes the data, calculates the consumed bytes, and retroactively overwrites the placeholder.
     * **Client Recursive Parsing:** Upgraded the client to parse binary streams dynamically. Implemented a recursive `print_response` function that reads the tag byte and conditionally consumes exactly the right amount of bytes, natively supporting nested arrays and preventing buffer underflows.
 * **Outcome:** A highly efficient, type-safe binary protocol that prepares the architecture for more complex, nested data types in the future.
+
+## v1.3: Sorted Sets & Polymorphic Database (Current)
+* **Goal:** Implement Sorted Sets (ZSETs) to support ranking, fast point lookups, and range queries.
+* **Architecture Shift:**
+    * **Multi-Type Store:** Transitioned the global hash table from a simple string store to a polymorphic database using an `Entry` struct with type tags (`T_STR`, `T_ZSET`). This enforces strict type safety at the command routing layer.
+    * **Dual Intrusive Data Structures:** Built the `ZSet` combining an AVL tree (for sorting) and a Hash table (for point lookups). The `ZNode` payload intrusively embeds both `AVLNode` and `HNode` simultaneously, decoupling the tree and hash logic from the payload itself.
+    * **Order Statistic Tree:** Augmented the AVL tree to track subtree sizes (`cnt`), enabling an `avl_offset` function that mathematically skips entire branches to achieve $O(\log N)$ range query offsets instead of standard $O(N)$ linear scans.
+    * **Memory Optimization:** Leveraged C-style Flexible Array Members (`char name[0]`) within `ZNode` to allocate the struct and its variable-length string in a single contiguous memory block, drastically reducing heap fragmentation and allocation overhead.
+    * **Zero-Allocation Lookups:** Introduced a stack-allocated `LookupKey` with a pre-calculated hash code to search the global dictionary, preventing unnecessary heap allocations during `GET`, `SET`, and `DEL` operations.
+* **Outcome:** A type-safe, multi-structure database engine capable of handling complex composite data types with enterprise-grade algorithmic efficiency.

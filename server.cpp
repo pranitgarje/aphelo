@@ -17,13 +17,15 @@
 #include <string>
 #include <vector>
 #include <map>
+#include <math.h>   // isnan
+#include "common.h"
+#include "zset.h"
 
 #include "hashtable.h"
 /*Remember how hashtable.cpp only gives us back an HNode*? We need to find the actual data (the string key/value) attached to it. This macro does pointer math. It takes the memory address of the HNode, subtracts its position inside the struct, and returns a pointer to the entire wrapper struct!*/
 
 typedef std::vector<uint8_t> Buffer;
-#define container_of(ptr, T, member) \
-    ((T *)( (char *)ptr - offsetof(T, member) ))
+
 
 
 static void msg(const char *msg) {
@@ -150,6 +152,8 @@ static int32_t parse_req(const uint8_t *data,size_t size,std::vector<std::string
 enum {
     ERR_UNKNOWN = 1,    // unknown command
     ERR_TOO_BIG = 2,    // response too big
+    ERR_BAD_TYP = 3,    // unexpected value type
+    ERR_BAD_ARG = 4,    // bad arguments
 };
 
 // data types of serialized data
@@ -190,20 +194,30 @@ static void out_int(Buffer &out, int64_t val) {
     buf_append_u8(out, TAG_INT);
     buf_append_i64(out, val);
 }
-// static void out_dbl(Buffer &out, double val) {
-//     buf_append_u8(out, TAG_DBL);
-//     buf_append_dbl(out, val);
-// }
+static void out_dbl(Buffer &out, double val) {
+     buf_append_u8(out, TAG_DBL);
+    buf_append_dbl(out, val);
+ }
 static void out_err(Buffer &out, uint32_t code, const std::string &msg) {
     buf_append_u8(out, TAG_ERR);
     buf_append_u32(out, code);
     buf_append_u32(out, (uint32_t)msg.size());
     buf_append(out, (const uint8_t *)msg.data(), msg.size());
 }
-// static void out_arr(Buffer &out, uint32_t n) {
-//     buf_append_u8(out, TAG_ARR);
-//     buf_append_u32(out, n);
-// }
+static void out_arr(Buffer &out, uint32_t n) {
+    buf_append_u8(out, TAG_ARR);
+    buf_append_u32(out, n);
+}
+static size_t out_begin_arr(Buffer &out) {
+    out.push_back(TAG_ARR);
+    buf_append_u32(out, 0);     // filled by out_end_arr()
+    return out.size() - 4;      // the `ctx` arg
+}
+static void out_end_arr(Buffer &out, size_t ctx, uint32_t n) {
+    assert(out[ctx - 1] == TAG_ARR);
+    memcpy(&out[ctx], &n, 4);
+}
+
 // // 1. The Output format
 // struct Response{
 //     uint32_t status=0;  //A simple integer code (0 = OK, 1 = Error, etc.).
@@ -218,85 +232,296 @@ static struct {
 /*This is your actual payload. Notice how HNode node; is embedded directly inside it.
  This is the "handle glued to the back" concept we discussed earlier.
   The hash table only cares about node, but you care about key and val.*/
+
+  // value types
+enum {
+    T_INIT  = 0,
+    T_STR   = 1,    // string
+    T_ZSET  = 2,    // sorted set
+};
+// KV pair for the top-level hashtable
 struct Entry {
     struct HNode node;  // hashtable node
     std::string key;
-    std::string val;
+    // value
+    uint32_t type = 0;    // one of the following
+    std::string str;
+    ZSet zset;
 };
-/*Your hash table needs to know if two keys are actually identical (in case of a hash collision).
-This function uses the container_of trick to grab the full Entry for both nodes, and then compares their C++ strings (le->key == re->key)*/
-static bool entry_eq(HNode *lhs, HNode *rhs) {
-    struct Entry *le = container_of(lhs, struct Entry, node);
-    struct Entry *re = container_of(rhs, struct Entry, node);
-    return le->key == re->key;
+static Entry *entry_new(uint32_t type) {
+    Entry *ent = new Entry();
+    ent->type = type;
+    return ent;
 }
-
+static void entry_del(Entry *ent) {
+    if (ent->type == T_ZSET) {
+        zset_clear(&ent->zset);
+    }
+    delete ent;
+}
+struct LookupKey {
+    struct HNode node;  // hashtable node
+    std::string key;
+};
+// equality comparison for the top-level hashstable
+static bool entry_eq(HNode *node, HNode *key) {
+    struct Entry *ent = container_of(node, struct Entry, node);
+    struct LookupKey *keydata = container_of(key, struct LookupKey, node);
+    return ent->key == keydata->key;
+}
 /*This is an implementation of the FNV-1a hash algorithm.
  It loops through every character in your string and scrambles it into a 64-bit integer (hcode).
   This number tells the hash table which bucket to put the entry in.*/
-static uint64_t str_hash(const uint8_t *data, size_t len) {
-    uint32_t h = 0x811C9DC5;
-    for (size_t i = 0; i < len; i++) {
-        h = (h + data[i]) * 0x01000193;
-    }
-    return h;
-}
+// static uint64_t str_hash(const uint8_t *data, size_t len) {
+//     uint32_t h = 0x811C9DC5;
+//     for (size_t i = 0; i < len; i++) {
+//         h = (h + data[i]) * 0x01000193;
+//     }
+//     return h;            moved to common.h 
+// }
 
+
+// static void do_get(std::vector<std::string> &cmd, Buffer &out) {
+//     // a dummy `Entry` just for the lookup
+//     Entry key;              //We create a temporary, fake Entry just to hold the key we are looking for.
+//     key.key.swap(cmd[1]);
+//     key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());         //We calculate the hash of the target string so the lookup function can find it fast.
+//     // hashtable lookup
+//     HNode *node = hm_lookup(&g_data.db, &key.node, &entry_eq);                   //We ask your custom hash table to find the node. We pass in the dummy key and our entry_eq comparison function. If it returns NULL, the key doesn't exist (RES_NX).
+//     if (!node) {
+//        return out_nil(out);
+//     }
+//     // copy the value
+//     const std::string &val = container_of(node, Entry, node)->val;
+//     out_str(out, val.data(),val.size());
+// }
 
 static void do_get(std::vector<std::string> &cmd, Buffer &out) {
-    // a dummy `Entry` just for the lookup
-    Entry key;              //We create a temporary, fake Entry just to hold the key we are looking for.
+    // a dummy struct just for the lookup
+    LookupKey key;
     key.key.swap(cmd[1]);
-    key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());         //We calculate the hash of the target string so the lookup function can find it fast.
-    // hashtable lookup
-    HNode *node = hm_lookup(&g_data.db, &key.node, &entry_eq);                   //We ask your custom hash table to find the node. We pass in the dummy key and our entry_eq comparison function. If it returns NULL, the key doesn't exist (RES_NX).
-    if (!node) {
-       return out_nil(out);
-    }
-    // copy the value
-    const std::string &val = container_of(node, Entry, node)->val;
-    out_str(out, val.data(),val.size());
-}
-
-static void do_set(std::vector<std::string> &cmd, Buffer &out) {
-    // a dummy `Entry` just for the lookup
-    Entry key;   //Similar to get, we create a dummy key and try to find it in the database first.
-    key.key.swap(cmd[1]);                                       //
     key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
     // hashtable lookup
     HNode *node = hm_lookup(&g_data.db, &key.node, &entry_eq);
-    if (node) {       //If found: We don't need to insert a new node. We just find the existing Entry and use .swap() to quickly replace the old value with the new one.
-        // found, update the value
-        container_of(node, Entry, node)->val.swap(cmd[2]);
-    } else {
-        // not found, allocate & insert a new pair
-        Entry *ent = new Entry();
-        ent->key.swap(key.key);
-        ent->node.hcode = key.node.hcode;
-        ent->val.swap(cmd[2]);
-        hm_insert(&g_data.db, &ent->node);
+    if (!node) {
+        return out_nil(out);
     }
-    /*If not found: We allocate fresh memory (new Entry()). 
-    We fill it with the key, the pre-calculated hash code,
-     and the value. Finally, we hand its &ent->node over to hm_insert to link it into the hash table.*/
-
-     return out_nil(out);  // NEW: Successfully set the data? Redis traditionally replies with NIL to save bandwidth.
+    // copy the value
+    Entry *ent = container_of(node, Entry, node);
+    if (ent->type != T_STR) {
+        return out_err(out, ERR_BAD_TYP, "not a string value");
+    }
+    return out_str(out, ent->str.data(), ent->str.size());
 }
 
+
+// static void do_set(std::vector<std::string> &cmd, Buffer &out) {
+//     // a dummy `Entry` just for the lookup
+//     Entry key;   //Similar to get, we create a dummy key and try to find it in the database first.
+//     key.key.swap(cmd[1]);                                       //
+//     key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
+//     // hashtable lookup
+//     HNode *node = hm_lookup(&g_data.db, &key.node, &entry_eq);
+//     if (node) {       //If found: We don't need to insert a new node. We just find the existing Entry and use .swap() to quickly replace the old value with the new one.
+//         // found, update the value
+//         container_of(node, Entry, node)->val.swap(cmd[2]);
+//     } else {
+//         // not found, allocate & insert a new pair
+//         Entry *ent = new Entry();
+//         ent->key.swap(key.key);
+//         ent->node.hcode = key.node.hcode;
+//         ent->val.swap(cmd[2]);
+//         hm_insert(&g_data.db, &ent->node);
+//     }
+//     /*If not found: We allocate fresh memory (new Entry()). 
+//     We fill it with the key, the pre-calculated hash code,
+//      and the value. Finally, we hand its &ent->node over to hm_insert to link it into the hash table.*/
+
+//      return out_nil(out);  // NEW: Successfully set the data? Redis traditionally replies with NIL to save bandwidth.
+// }
+static void do_set(std::vector<std::string> &cmd, Buffer &out) {
+    // a dummy struct just for the lookup
+    LookupKey key;
+    key.key.swap(cmd[1]);
+    key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
+    // hashtable lookup
+    HNode *node = hm_lookup(&g_data.db, &key.node, &entry_eq);
+    if (node) {
+        // found, update the value
+        Entry *ent = container_of(node, Entry, node);
+        if (ent->type != T_STR) {
+            return out_err(out, ERR_BAD_TYP, "a non-string value exists");
+        }
+        ent->str.swap(cmd[2]);
+    } else {
+        // not found, allocate & insert a new pair
+        Entry *ent = entry_new(T_STR);
+        ent->key.swap(key.key);
+        ent->node.hcode = key.node.hcode;
+        ent->str.swap(cmd[2]);
+        hm_insert(&g_data.db, &ent->node);
+    }
+    return out_nil(out);
+}
+// static void do_del(std::vector<std::string> &cmd, Buffer &out) {
+//     // a dummy `Entry` just for the lookup
+//     Entry key;
+//     key.key.swap(cmd[1]);
+//     key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
+//     // hashtable delete
+//     HNode *node = hm_delete(&g_data.db, &key.node, &entry_eq);         //: This removes the node from the hash table's linked list and returns the detached node to us.
+//     if (node) { // deallocate the pair
+//         delete container_of(node, Entry, node);        //Because the hash table only manages links (not memory), it is our job to free the memory. We find the parent Entry and delete it so we don't cause a memory leak.
+//         return out_int(out, 1); // NEW: Send an INT tag with '1' meaning "1 item deleted"
+//     }
+//     return out_int(out,0); // NEW: If the key doesn't exist, we reply with '0' meaning "0 items deleted"
+// }
 static void do_del(std::vector<std::string> &cmd, Buffer &out) {
-    // a dummy `Entry` just for the lookup
-    Entry key;
+    // a dummy struct just for the lookup
+    LookupKey key;
     key.key.swap(cmd[1]);
     key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
     // hashtable delete
-    HNode *node = hm_delete(&g_data.db, &key.node, &entry_eq);         //: This removes the node from the hash table's linked list and returns the detached node to us.
+    HNode *node = hm_delete(&g_data.db, &key.node, &entry_eq);
     if (node) { // deallocate the pair
-        delete container_of(node, Entry, node);        //Because the hash table only manages links (not memory), it is our job to free the memory. We find the parent Entry and delete it so we don't cause a memory leak.
-        return out_int(out, 1); // NEW: Send an INT tag with '1' meaning "1 item deleted"
+        entry_del(container_of(node, Entry, node));
     }
-    return out_int(out,0); // NEW: If the key doesn't exist, we reply with '0' meaning "0 items deleted"
+    return out_int(out, node ? 1 : 0);
+}
+static bool cb_keys(HNode *node, void *arg) {
+    Buffer &out = *(Buffer *)arg;
+    const std::string &key = container_of(node, Entry, node)->key;
+    out_str(out, key.data(), key.size());
+    return true;
 }
 
+static void do_keys(std::vector<std::string> &, Buffer &out) {
+    out_arr(out, (uint32_t)hm_size(&g_data.db));
+    hm_foreach(&g_data.db, &cb_keys, (void *)&out);
+}
+
+static bool str2dbl(const std::string &s, double &out) {
+    char *endp = NULL;
+    out = strtod(s.c_str(), &endp);
+    return endp == s.c_str() + s.size() && !isnan(out);
+}
+
+static bool str2int(const std::string &s, int64_t &out) {
+    char *endp = NULL;
+    out = strtoll(s.c_str(), &endp, 10);
+    return endp == s.c_str() + s.size();
+}
+
+// zadd zset score name
+static void do_zadd(std::vector<std::string> &cmd, Buffer &out) {
+    double score = 0;
+    if (!str2dbl(cmd[2], score)) {
+        return out_err(out, ERR_BAD_ARG, "expect float");
+    }
+
+    // look up or create the zset
+    LookupKey key;
+    key.key.swap(cmd[1]);
+    key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
+    HNode *hnode = hm_lookup(&g_data.db, &key.node, &entry_eq);
+
+    Entry *ent = NULL;
+    if (!hnode) {   // insert a new key
+        ent = entry_new(T_ZSET);
+        ent->key.swap(key.key);
+        ent->node.hcode = key.node.hcode;
+        hm_insert(&g_data.db, &ent->node);
+    } else {        // check the existing key
+        ent = container_of(hnode, Entry, node);
+        if (ent->type != T_ZSET) {
+            return out_err(out, ERR_BAD_TYP, "expect zset");
+        }
+    }
+
+    // add or update the tuple
+    const std::string &name = cmd[3];
+    bool added = zset_insert(&ent->zset, name.data(), name.size(), score);
+    return out_int(out, (int64_t)added);
+}
+
+static const ZSet k_empty_zset;
+
+static ZSet *expect_zset(std::string &s) {
+    LookupKey key;
+    key.key.swap(s);
+    key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
+    HNode *hnode = hm_lookup(&g_data.db, &key.node, &entry_eq);
+    if (!hnode) {   // a non-existent key is treated as an empty zset
+        return (ZSet *)&k_empty_zset;
+    }
+    Entry *ent = container_of(hnode, Entry, node);
+    return ent->type == T_ZSET ? &ent->zset : NULL;
+}
+
+// zrem zset name
+static void do_zrem(std::vector<std::string> &cmd, Buffer &out) {
+    ZSet *zset = expect_zset(cmd[1]);
+    if (!zset) {
+        return out_err(out, ERR_BAD_TYP, "expect zset");
+    }
+
+    const std::string &name = cmd[2];
+    ZNode *znode = zset_lookup(zset, name.data(), name.size());
+    if (znode) {
+        zset_delete(zset, znode);
+    }
+    return out_int(out, znode ? 1 : 0);
+}
+
+// zscore zset name
+static void do_zscore(std::vector<std::string> &cmd, Buffer &out) {
+    ZSet *zset = expect_zset(cmd[1]);
+    if (!zset) {
+        return out_err(out, ERR_BAD_TYP, "expect zset");
+    }
+
+    const std::string &name = cmd[2];
+    ZNode *znode = zset_lookup(zset, name.data(), name.size());
+    return znode ? out_dbl(out, znode->score) : out_nil(out);
+}
+
+// zquery zset score name offset limit
+static void do_zquery(std::vector<std::string> &cmd, Buffer &out) {
+    // parse args
+    double score = 0;
+    if (!str2dbl(cmd[2], score)) {
+        return out_err(out, ERR_BAD_ARG, "expect fp number");
+    }
+    const std::string &name = cmd[3];
+    int64_t offset = 0, limit = 0;
+    if (!str2int(cmd[4], offset) || !str2int(cmd[5], limit)) {
+        return out_err(out, ERR_BAD_ARG, "expect int");
+    }
+
+    // get the zset
+    ZSet *zset = expect_zset(cmd[1]);
+    if (!zset) {
+        return out_err(out, ERR_BAD_TYP, "expect zset");
+    }
+
+    // seek to the key
+    if (limit <= 0) {
+        return out_arr(out, 0);
+    }
+    ZNode *znode = zset_seekge(zset, score, name.data(), name.size());
+    znode = znode_offset(znode, offset);
+
+    // output
+    size_t ctx = out_begin_arr(out);
+    int64_t n = 0;
+    while (znode && n < limit) {
+        out_str(out, znode->name, znode->len);
+        out_dbl(out, znode->score);
+        znode = znode_offset(znode, +1);
+        n += 2;
+    }
+    out_end_arr(out, ctx, (uint32_t)n);
+}
 
 static void do_request(std::vector<std::string> &cmd, Buffer &out) {
     if (cmd.size() == 2 && cmd[0] == "get") {
@@ -305,10 +530,21 @@ static void do_request(std::vector<std::string> &cmd, Buffer &out) {
         return do_set(cmd, out);
     } else if (cmd.size() == 2 && cmd[0] == "del") {
         return do_del(cmd, out);
+    } else if (cmd.size() == 1 && cmd[0] == "keys") {
+        return do_keys(cmd, out);
+    } else if (cmd.size() == 4 && cmd[0] == "zadd") {
+        return do_zadd(cmd, out);
+    } else if (cmd.size() == 3 && cmd[0] == "zrem") {
+        return do_zrem(cmd, out);
+    } else if (cmd.size() == 3 && cmd[0] == "zscore") {
+        return do_zscore(cmd, out);
+    } else if (cmd.size() == 6 && cmd[0] == "zquery") {
+        return do_zquery(cmd, out);
     } else {
-        return out_err(out, ERR_UNKNOWN, "unrecognized command");
+        return out_err(out, ERR_UNKNOWN, "unknown command.");
     }
 }
+
 
 // /*Structure: The response protocol is simple: [Total Length] [Status Code] [Data Payload].
 // resp_len: It calculates 4 (for the status code) + size of data.
@@ -353,6 +589,27 @@ static void do_request(std::vector<std::string> &cmd, Buffer &out) {
 
 // const size_t k_max_msg = 4096;    //It allocates 4 bytes for the header (length) and 4096 bytes for the maximum allowed message body.
 // process 1 request if there is enough data
+
+static void response_begin(Buffer &out, size_t *header) {
+    *header = out.size();       // messege header position
+    buf_append_u32(out, 0);     // reserve space
+}
+
+static size_t response_size(Buffer &out, size_t header) {
+    return out.size() - header - 4;
+}
+
+static void response_end(Buffer &out, size_t header) {
+    size_t msg_size = response_size(out, header);
+    if (msg_size > k_max_msg) {
+        out.resize(header + 4);
+        out_err(out, ERR_TOO_BIG, "response is too big.");
+        msg_size = response_size(out, header);
+    }
+    // message header
+    uint32_t len = (uint32_t)msg_size;
+    memcpy(&out[header], &len, 4);
+}
 static bool try_one_request(Conn *conn) {
     // try to parse the protocol: message header
     if (conn->incoming.size() < 4) {      //Checks if we have at least 4 bytes (the header). If not, returns false (need more data).
@@ -386,23 +643,14 @@ static bool try_one_request(Conn *conn) {
     // make_response(resp, conn->outgoing);
     // // application logic done! remove the request message.
 
-    std::vector<uint8_t> &out=conn->outgoing;
-    // 1. The Placeholder Trick
-    out.insert(out.end(),4,0);   //We reserve 4 bytes at the end of the outgoing buffer for the length header. We will fill it in later after we know how big the response is.
-
-    // 2. Remember where we put the placeholder
-    // (In case the buffer already had data from a previous pipelined request)
-    size_t header_pos=out.size()-4;
-    // 3. Build the TLV message
-    // This will use out_str, out_nil, etc., to push bytes AFTER the placeholder.
-    do_request(cmd, out);
-    // 4. Calculate the actual length of the TLV data we just added
-    // (Total current size) - (Where the header started) - (4 bytes for the header itself)
-    uint32_t res_len = (uint32_t)(out.size() - header_pos - 4);
-    // 5. Overwrite the placeholder with the real length!
-    memcpy(out.data()+header_pos, &res_len, 4);   //We write the actual length of the response into the reserved header space.
+    
+  size_t header_pos = 0;
+    response_begin(conn->outgoing, &header_pos);
+    do_request(cmd, conn->outgoing);
+    response_end(conn->outgoing, header_pos);
+    
+    // application logic done! remove the request message.
     buf_consume(conn->incoming, 4 + len);
-    // Q: Why not just empty the buffer? See the explanation of "pipelining".
     return true;        // success
  
     
@@ -495,7 +743,7 @@ int main(){
     setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &val, sizeof(val));
     struct sockaddr_in addr={};
     addr.sin_family=AF_INET;
-    addr.sin_port=htons(12345);
+    addr.sin_port=htons(1234);
     addr.sin_addr.s_addr=htonl(INADDR_ANY);
     int rv=bind(fd,(const struct sockaddr*)&addr, sizeof(addr));
     if(rv){

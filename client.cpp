@@ -130,6 +130,17 @@ static int32_t print_response(const uint8_t *data,size_t size){
                 return 1 + 8;
 
             }
+            case TAG_DBL:
+            if (size < 1 + 8) {
+                msg("bad response");
+                return -1;
+            }
+            {
+                double val = 0;
+                memcpy(&val, &data[1], 8);
+                printf("(dbl) %g\n", val); // %g prints a double cleanly
+                return 1 + 8;
+            }
         case TAG_ARR:
             {
                 if(size<1+4){
@@ -139,6 +150,8 @@ static int32_t print_response(const uint8_t *data,size_t size){
                 uint32_t len=0;
                 size_t arr_bytes=1+4;         // Keeps a running tally of how many bytes we've processed so far. We start at 5 (Tag + Length).
                 memcpy(&len,&data[1],4);    //Reads the number of elements in the array, not the number of bytes.
+                // ---> THE MISSING LINE <---
+                printf("(arr) len=%u\n", len);
                 for(uint32_t i=0;i<len;i++){
                     int32_t rv=print_response(&data[arr_bytes],size-arr_bytes);   //It shifts the pointer forward by arr_bytes and passes the remaining buffer back into the print_response function.
                     if(rv<0){
@@ -240,7 +253,7 @@ int main(int argc, char **argv){
     }
     struct sockaddr_in addr = {};
     addr.sin_family = AF_INET;
-    addr.sin_port = htons(12345);
+    addr.sin_port = htons(1234);
     addr.sin_addr.s_addr = inet_addr("127.0.0.1");
     int rv = connect(fd, (const struct sockaddr *)&addr, sizeof(addr));
     if (rv) {

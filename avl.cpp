@@ -145,3 +145,33 @@ AVLNode *avl_del(AVLNode *node) {
     *from = victim;
     return root;
 }
+
+// offset into the succeeding or preceding node.
+// note: the worst-case is O(log N) regardless of how long the offset is.
+AVLNode *avl_offset(AVLNode *node, int64_t offset) {
+    int64_t pos = 0; // the rank difference from the starting node
+    while (offset != pos) {
+        if (pos < offset && pos + avl_cnt(node->right) >= offset) {
+            // the target is inside the right subtree
+            node = node->right;
+            pos += avl_cnt(node->left) + 1;
+        } else if (pos > offset && pos - avl_cnt(node->left) <= offset) {
+            // the target is inside the left subtree
+            node = node->left;
+            pos -= avl_cnt(node->right) + 1;
+        } else {
+            // go to the parent
+            AVLNode *parent = node->parent;
+            if (!parent) {
+                return NULL; // out of bounds
+            }
+            if (parent->right == node) {
+                pos -= avl_cnt(node->left) + 1;
+            } else {
+                pos += avl_cnt(node->right) + 1;
+            }
+            node = parent;
+        }
+    }
+    return node;
+}

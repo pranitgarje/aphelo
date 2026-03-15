@@ -20,12 +20,12 @@ avl.o: avl.cpp avl.h
 $(LIBRARY): avl.o
 	ar rcs $(LIBRARY) avl.o
 
-# ---------------------------------------------------------
+
 # 2. SERVER & CLIENT BUILD RULES
 # ---------------------------------------------------------
-# Server now depends on the static library
-server: server.cpp hashtable.cpp hashtable.h $(LIBRARY)
-	$(CXX) $(CXXFLAGS) server.cpp hashtable.cpp -L. -lavl -o server
+# Server now depends on the static library AND the new zset logic
+server: server.cpp hashtable.cpp zset.cpp hashtable.h zset.h $(LIBRARY)
+	$(CXX) $(CXXFLAGS) server.cpp hashtable.cpp zset.cpp -L. -lavl -o server
 
 client: client.cpp $(LIBRARY)
 	$(CXX) $(CXXFLAGS) client.cpp -o client
